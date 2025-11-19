@@ -160,6 +160,34 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   cuda_archs_loose_intersection(CUDA_ARCHS
     "${CUDA_SUPPORTED_ARCHS}" "${CUDA_ARCHS}")
   message(STATUS "CUDA supported target architectures: ${CUDA_ARCHS}")
+  #  ===== BEGIN SM100/SM120 BLACKWELL FORCE-INJECT PATCH =====
+  # CUDA 13.0+ uses family-specific codes (10.0f, 12.0f), older versions use 10.0a, 12.0a
+  # Remove any existing Blackwell archs to avoid duplicates, then add the correct variant
+  
+  # Remove all SM100 variants first
+  list(REMOVE_ITEM CUDA_ARCHS "10.0" "10.0a" "10.0f")
+  # Add back the correct SM100 variant
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    list(APPEND CUDA_ARCHS "10.0f")
+    message(STATUS "Forced SM100 arch 10.0f into CUDA_ARCHS for MoE support")
+  else()
+    list(APPEND CUDA_ARCHS "10.0a")
+    message(STATUS "Forced SM100 arch 10.0a into CUDA_ARCHS for MoE support")
+  endif()
+
+  # Remove all SM120 variants first
+  list(REMOVE_ITEM CUDA_ARCHS "12.0" "12.0a" "12.0f")
+  # Add back the correct SM120 variant
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    list(APPEND CUDA_ARCHS "12.0f")
+    message(STATUS "Forced SM120 arch 12.0f into CUDA_ARCHS for RTX 5090 support")
+  else()
+    list(APPEND CUDA_ARCHS "12.0a")
+    message(STATUS "Forced SM120 arch 12.0a into CUDA_ARCHS for RTX 5090 support")
+  endif()
+  # ===== END SM100/SM120 PATCH =====
+
+
 else()
   #
   # For other GPU targets override the GPU architectures detected by cmake/torch
@@ -762,6 +790,35 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       message(STATUS "Not building blockwise_scaled_group_mm_sm100 as no compatible archs found "
                      "in CUDA target architectures")
     endif()
+  endif()
+
+  # CUTLASS MoE kernels for SM120 (GeForce Blackwell RTX 5090)
+  # Now ENABLED with CUTLASS v4.3.0 - includes grouped GEMM support for SM120
+  # See example 92: https://github.com/NVIDIA/cutlass/tree/main/examples/92_blackwell_moe_gemm
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(MOE_SM120_ARCHS "12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(MOE_SM120_ARCHS "12.0a" "${CUDA_ARCHS}")
+  endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND MOE_SM120_ARCHS)
+    # FP8 MoE kernel (standard grouped GEMM)
+    set(SRCS "csrc/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm120.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${MOE_SM120_ARCHS}")
+    list(APPEND VLLM_EXT_SRC "${SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_CUTLASS_MOE_SM120=1")
+    message(STATUS "Building grouped_mm_c3x_sm120 for archs: ${MOE_SM120_ARCHS}")
+    
+    # Blockwise MoE kernel for MXFP4/NVFP4 support
+    set(SRCS "csrc/quantization/w8a8/cutlass/moe/blockwise_scaled_group_mm_sm120.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${MOE_SM120_ARCHS}")
+    list(APPEND VLLM_EXT_SRC "${SRCS}")
+    message(STATUS "Building blockwise_scaled_group_mm_sm120 for archs: ${MOE_SM120_ARCHS}")
+  else()
+    message(STATUS "SM120 MoE kernels require CUDA 12.8+ and CUTLASS v4.3.0+")
   endif()
 
   #

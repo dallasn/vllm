@@ -93,6 +93,11 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         return get_mxfp4_backend_with_lora()
 
     if current_platform.is_cuda():
+        # Check if Marlin is explicitly requested first
+        if envs.VLLM_MXFP4_USE_MARLIN:
+            logger.info_once("Using Marlin backend (explicitly requested)")
+            return Mxfp4Backend.MARLIN
+        
         if (
             current_platform.is_device_capability(90)
             and has_flashinfer()
@@ -101,28 +106,33 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
             return Mxfp4Backend.SM90_FI_MXFP4_BF16
         elif (
-            current_platform.is_device_capability(100)
+            (current_platform.is_device_capability(100) or
+             current_platform.is_device_capability(120))
             and has_flashinfer()
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
         ):
-            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100")
+            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100/SM120")
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
         elif (
-            current_platform.is_device_capability(100)
+            (current_platform.is_device_capability(100) or
+             current_platform.is_device_capability(120))
             and has_flashinfer()
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
         ):
+            logger.info_once("Using FlashInfer MXFP4 MXFP8 TensorRT-LLM backend for SM100/SM120")
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-        elif current_platform.is_device_capability(100) and has_flashinfer():
+        elif (current_platform.is_device_capability(100) or
+              current_platform.is_device_capability(120)) and has_flashinfer():
             logger.info_once(
-                "Using FlashInfer MXFP4 BF16 backend for SM100, "
-                "For faster performance on SM100, consider setting "
+                "Using FlashInfer MXFP4 BF16 backend for SM100/SM120, "
+                "For faster performance on SM100/SM120, consider setting "
                 "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
                 "accuracy."
             )
             return Mxfp4Backend.SM100_FI_MXFP4_BF16
         elif (
             current_platform.is_device_capability(100)
+            or current_platform.is_device_capability(120)
             or current_platform.is_device_capability(90)
         ) and not has_flashinfer():
             logger.warning_once(
@@ -386,7 +396,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
             or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
         ):
-            from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
+            try:
+                from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
+            except ImportError:
+                raise RuntimeError(
+                    f"FlashInfer backend selected ({self.mxfp4_backend}) but FlashInfer is not installed. "
+                    "Please install FlashInfer or use Marlin backend with VLLM_MXFP4_USE_MARLIN=1"
+                )
             from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
 
             layer.gemm1_alpha = Parameter(
@@ -941,14 +957,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from flashinfer import trtllm_fp4_block_scale_moe
 
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16:
+                logger.info_once("MXFP4 MoE using FlashInfer backend with BF16 activations (SM100/SM120)")
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
             elif self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM:
+                logger.info_once("MXFP4 MoE using TensorRT-LLM backend with MXFP8 activations (SM100 kernels)")
                 from flashinfer import mxfp8_quantize
 
-                x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+                x_quant, x_scale = mxfp8_quantize(x, False, 32)  # to mxfp8 with block_size=32
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+
+            # Map activation string to integer for TensorRT-LLM backend
+            # 0 = swigluoai (SwiGLU with OAI ordering: silu(gate) * up)
+            # 1 = swiglu (standard SwiGLU)
+            # 2 = silu
+            activation_type_map = {
+                "swigluoai": 0,
+                "swiglu": 1,
+                "silu": 2,
+            }
+            activation_int = activation_type_map.get(activation, 0)
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
@@ -974,11 +1003,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size,  # padded to multiple of 256
                 layer.ep_rank * layer.local_num_experts,  # local_expert_offset
                 self.num_experts,  # local num experts
-                None,
-                None,
-                1 if renormalize else 0,  # routing_method_type, renormalize
-                True,  # do finalize
-                tune_max_num_tokens=max(self.max_capture_size, 1),
+                routed_scaling_factor,
+                routing_method_type=1,  # 1=Renormalize (softmax after topk)
+                do_finalize=True,
+                gated_act_type=activation_int,  # integer encoding for TensorRT-LLM backend
+                tune_max_num_tokens=max(self.max_capture_size, 8192) if self.max_capture_size < 256 else self.max_capture_size,
             )[0]
             return trtllm_gen_output
         elif (
@@ -1002,6 +1031,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
+                # Use MXFP8 activation quantization with CUTLASS backend
+                # NOTE: Despite the enum name, FlashInfer automatically selects the correct
+                # architecture-specific kernels at runtime (SM100 for datacenter Blackwell,
+                # SM120 for GeForce Blackwell) based on torch.cuda.get_device_capability()
+                major, minor = torch.cuda.get_device_capability()
+                arch = f"SM{major}{minor}0"
+                logger.info_once(f"MXFP4 MoE using CUTLASS backend with MXFP8 activations (detected {arch})")
                 from flashinfer import mxfp8_quantize
 
                 x_quant, x_scale = mxfp8_quantize(x, True, 32)
@@ -1022,6 +1058,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight.contiguous().view(torch.long),
                 )
             elif self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16:
+                logger.info_once("MXFP4 MoE using FlashInfer backend with BF16 activations (SM90)")
                 assert x.dtype == torch.bfloat16
 
                 quant_scales = [
